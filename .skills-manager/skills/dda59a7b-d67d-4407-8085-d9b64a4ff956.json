@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "skill_id": "dda59a7b-d67d-4407-8085-d9b64a4ff956",
+  "path": "react-best-practices",
+  "path_key": "react-best-practices",
+  "enabled": true,
+  "tags": [],
+  "source": {
+    "type": "skillssh",
+    "ref": "poteto/noodle/react-best-practices",
+    "subpath": ".agents/skills/react-best-practices",
+    "branch": null
+  }
+}

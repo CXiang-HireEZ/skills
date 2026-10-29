@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "skill_id": "4a3eeb37-1913-4725-9693-df3400a8dd07",
+  "path": "ts-best-practices",
+  "path_key": "ts-best-practices",
+  "enabled": true,
+  "tags": [],
+  "source": {
+    "type": "skillssh",
+    "ref": "poteto/noodle/ts-best-practices",
+    "subpath": ".agents/skills/ts-best-practices",
+    "branch": null
+  }
+}

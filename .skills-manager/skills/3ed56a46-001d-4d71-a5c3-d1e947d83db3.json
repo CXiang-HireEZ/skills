@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "skill_id": "3ed56a46-001d-4d71-a5c3-d1e947d83db3",
+  "path": "adversarial-review",
+  "path_key": "adversarial-review",
+  "enabled": true,
+  "tags": [],
+  "source": {
+    "type": "skillssh",
+    "ref": "poteto/noodle/adversarial-review",
+    "subpath": ".agents/skills/adversarial-review",
+    "branch": null
+  }
+}

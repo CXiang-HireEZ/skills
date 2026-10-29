@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "skill_id": "4a0c5cad-dbc2-4880-b1f1-f953ee30450d",
+  "path": "unslop",
+  "path_key": "unslop",
+  "enabled": true,
+  "tags": [],
+  "source": {
+    "type": "skillssh",
+    "ref": "cursor/plugins/unslop",
+    "subpath": "harness/pstack/claude-code/skills/unslop",
+    "branch": null
+  }
+}
