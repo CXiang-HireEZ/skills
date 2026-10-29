@@ -1,0 +1,83 @@
+---
+name: hireez-git-conventions
+description: HireEZ git conventions for commit messages, branch names, PR targets, and the work log database in the Obsidian vault (~/Documents/Hireez/Work Log). Use when committing, creating or naming a branch, opening, closing or merging a PR, or updating the work log in a HireTeamMate repo (TM-Hiretual-Frontend, htm-backend, native-agent-frontend, native-agent-backend).
+---
+
+# HireEZ git conventions
+
+Applies to `TM-Hiretual-Frontend`, `htm-backend`, `native-agent-frontend`, `native-agent-backend`. (`TM-Hiretual-Backend-proxy` has no consistent convention.)
+
+## Commit messages
+
+```
+<TICKET> <Imperative description> [ez-ai-assisted]
+```
+
+- Ticket first, then a space. No colon, no `feat:`/`fix:` prefix. Ticket is a Jira key, almost always `HT5-xxxxx`.
+- Imperative, plain-English sentence describing the behavior change, e.g. `HT5-45806 Let the candidate sign with any name they type`.
+- Append `[ez-ai-assisted]` when AI helped significantly.
+- Test-only commits: `<TICKET> [fix-ut]<description>`, e.g. `HT5-45930 [fix-ut]Check the offer approval is among the personal cards`.
+- Merge commits also lead with the ticket: `HT5-45806 Merge erbing/HT5-45806 into the 10/18 hotfix`.
+
+Documented in `native-agent-backend/AGENTS.md` and `native-agent-backend/docs/legacy/claude-guide.md`.
+
+## Long-lived branches
+
+- `master`: default / production.
+- `develop`: integration.
+- `hotfix/MMDDYYYY`: dated hotfix branch (e.g. `hotfix/10182026`), PR'd into `master`.
+- `release/*`, `common/*`: also valid PR targets per CI.
+- Releases are tags, not branches: `release/MMDDYYYY`, then `.1`, `.2`, … for follow-ups.
+
+## Workflow for bug fixes and feature changes (Xiang's convention)
+
+Follow this for every bug fix or feature modification.
+
+1. **Branch from the latest release tag.** Fetch tags and cut the work branch from the newest `release/*` tag:
+   ```bash
+   git fetch origin --tags
+   TAG=$(git tag -l 'release/*' --sort=-creatordate | head -1)
+   git checkout -b xiangchen/<TICKET>[/<short-description>] "$TAG"
+   ```
+2. **Name the branch** `xiangchen/<TICKET>/<optional-short-description>`, e.g. `xiangchen/HT5-46102` or `xiangchen/HT5-46102/fix-offer-signature`. This is the "from-release" branch.
+3. **Test via `develop`.** Open a PR from the from-release branch into `develop`.
+   - If that PR has conflicts, don't resolve them on the from-release branch. Instead cut `xiangchen/from-develop/<TICKET>` from `origin/develop`, cherry-pick the from-release commits onto it, resolve conflicts there, and open the `develop` PR from this branch.
+4. **Keep the two branches in sync.** Any follow-up fix goes onto the from-release branch first and is cherry-picked onto the from-develop branch (or vice versa), so both carry the same change.
+5. **Ship to production.** Once the change is tested and approved, PR the from-release branch into `master` (the production branch). Never PR the from-develop branch into `master`.
+   - **Never do this step on your own.** Don't open or merge the `master` PR as part of finishing a task. Only do it when Xiang explicitly says to.
+
+## Work log (Obsidian vault)
+
+The work log is a Notion Bases database: the folder `~/Documents/Hireez/Work Log/` (Obsidian vault `~/Documents/Hireez`), configured by `_database.md`. Each ticket per repo is one note, `Tickets/<TICKET> <repo>.md`, whose frontmatter is the row (the views include subfolders):
+
+```yaml
+summary: "..."            # Jira summary; set by the sync
+jira: "https://hiretual.atlassian.net/browse/HT5-xxxxx"
+status: "Test-QA"          # Jira status, short name; set by the sync
+repo: "native-agent-backend"
+change: "A few words"
+develop_pr: "https://github.com/HireTeamMate/<repo>/pull/456"
+develop_state: "Merged"    # set by the sync
+master_pr:
+master_state:              # set by the sync
+done:                      # master PR merge date; set by the sync
+```
+
+Views: **Ongoing** (no `done`), **By status** (board grouped by Jira status), **Done** (newest first).
+
+- The sync runs every 15 minutes (launchd job `com.xiangchen.worklog-sync`, log `~/Library/Logs/worklog-sync.log`). It imports open Jira tickets where Xiang is assignee, Engg Owner, an Involved Engineer or a Stakeholder as repo-less notes `Tickets/<TICKET>.md`. A repo-less row with no PRs gets `done` when its Jira ticket reaches the Done category.
+- Update it in the same step as the git action. Create the row when you cut the from-release branch (this claims the imported `<TICKET>.md` if there is one; for a second repo, run it again):
+  `~/.claude/skills/hireez-git-conventions/worklog-sync.py add HT5-xxxxx <repo> "A few words"`
+- Fill in `develop_pr` / `master_pr` by editing that note's frontmatter as the PRs are opened (URL only). If a PR is replaced, swap in the new URL.
+- Don't set `status`, `*_state` or `done` by hand. Run `~/.claude/skills/hireez-git-conventions/worklog-sync.py` after any edit. It refreshes the Jira status (short names in `STATUS_NAMES`), each PR's state (Merged / Closed / Draft / CI failing / Changes requested / Approved / Open), and sets `done` once the `master` PR merges, which moves the row to the Done view. Never delete row notes.
+
+## Other branch names seen in the repos
+
+Documented format: `username/from-branch/TICKET-ID` (e.g. `alice/from-dev/IM-10481`). Teammates also use `username/TICKET`, `username/from-hotfix/TICKET`, `from-hotfix/TICKET`, and `username/develop/TICKET-short-suffix`. Use the workflow above for your own branches.
+
+## Hooks and CI
+
+- `TM-Hiretual-Frontend`, `native-agent-frontend`: pre-commit runs lint-staged + `ts-check`.
+- `htm-backend`: pre-commit is off unless `HTM_PRECOMMIT=1` or `git config htm.precommit.enabled true`; pre-push always runs lint-staged + full build.
+- No commitlint and no PR templates; the format is not enforced automatically.
+- PR CI runs on PRs into `develop`, `master`, `release/*`, `hotfix/*`.

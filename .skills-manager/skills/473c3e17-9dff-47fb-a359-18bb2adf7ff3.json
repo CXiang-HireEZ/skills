@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "skill_id": "473c3e17-9dff-47fb-a359-18bb2adf7ff3",
+  "path": "hireez-git-conventions-2",
+  "path_key": "hireez-git-conventions-2",
+  "enabled": true,
+  "tags": [],
+  "source": {
+    "type": "import",
+    "ref": null,
+    "subpath": null,
+    "branch": null
+  }
+}
