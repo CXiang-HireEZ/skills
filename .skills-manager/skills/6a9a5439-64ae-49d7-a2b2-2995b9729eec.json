@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "skill_id": "6a9a5439-64ae-49d7-a2b2-2995b9729eec",
+  "path": "bro",
+  "path_key": "bro",
+  "enabled": true,
+  "tags": [],
+  "source": {
+    "type": "skillssh",
+    "ref": "cursor/plugins/bro",
+    "subpath": "harness/pstack/claude-code/skills/bro",
+    "branch": null
+  }
+}
