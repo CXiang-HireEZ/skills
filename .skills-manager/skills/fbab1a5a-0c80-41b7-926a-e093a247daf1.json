@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "skill_id": "fbab1a5a-0c80-41b7-926a-e093a247daf1",
+  "path": "hireez-local-dev-2",
+  "path_key": "hireez-local-dev-2",
+  "enabled": true,
+  "tags": [],
+  "source": {
+    "type": "local",
+    "ref": null,
+    "subpath": null,
+    "branch": null
+  }
+}
