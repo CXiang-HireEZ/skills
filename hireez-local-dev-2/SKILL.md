@@ -22,35 +22,34 @@ description: Set up and run the HireEZ local dev environment (TM-Hiretual-Fronte
 3. `htm-backend` (needs `.env`, contents copied from `envs.yaml`)
 4. `native-agent-frontend` and `native-agent-backend`
 
-## Startup script
+## Startup commands
 
-`scripts/dev-stack.sh` (in this skill's directory) runs the pipeline in that order, in the background, waiting for each service's port before starting the next.
+Give the user one direct command for each service. Do not wrap the commands in a script. Each command runs in the foreground, so the user starts each service in its own terminal, in the startup order above, and stops it with Ctrl-C.
 
-```bash
-S=~/.claude/skills/hireez-local-dev/scripts/dev-stack.sh
-$S                      # start everything from ~/Projects
-$S --no-agent           # skip the agent frontend/backend
-$S --only htm,agent-be  # start a subset
-$S status               # pid / port / state per service
-$S logs htm             # tail a service log
-$S stop                 # stop what the script started
-```
+For a worktree, replace the `~/Projects/<repo>` directory with the worktree path. Env files are gitignored, so a new worktree does not have them. Copy the env file from the `~/Projects` checkout first, for example `cp ~/Projects/htm-backend/.env <worktree>/.env`.
 
-Use a worktree for any repo by overriding its directory; the rest stay on `~/Projects`:
+The Node repos pin Node 18 (18.12.1). Run `nvm use 18` in the terminal first.
 
 ```bash
-$S --htm ~/Projects/htm-backend-wt/HT5-12345 --agent-be ../native-agent-backend-wt
+# 1. TM-Hiretual-Backend-proxy, port 9002
+cd ~/Projects/TM-Hiretual-Backend-proxy && nvm use 18 && npm run dev
+
+# 2. TM-Hiretual-Frontend, port 8081 (needs .env.development)
+cd ~/Projects/TM-Hiretual-Frontend && nvm use 18 && npm start
+
+# 3. htm-backend, port HTTP_PORT from its .env (9004 at the time of writing; default 9001)
+cd ~/Projects/htm-backend && nvm use 18 && npm run start:dev
+
+# 4a. native-agent-backend, port 8000 (needs .env)
+cd ~/Projects/native-agent-backend && uv run uvicorn app.main:app --reload --port 8000 --app-dir src
+
+# 4b. native-agent-frontend, port 8082 (needs .env.development)
+cd ~/Projects/native-agent-frontend && nvm use 18 && npm run dev
 ```
 
-Flags: `--projects DIR`, `--proxy DIR`, `--frontend DIR`, `--htm DIR`, `--agent-be DIR`, `--agent-fe DIR`, `--no-agent`, `--only LIST`, `--install`.
+If `node_modules` is missing, run `npm ci` first (`npm install` for `TM-Hiretual-Backend-proxy`, which has no lockfile). If `.venv` is missing in `native-agent-backend`, run `uv sync` first.
 
-Behavior:
-- Service names: `proxy`, `frontend`, `htm`, `agent-be`, `agent-fe`.
-- Ports waited on: proxy 9002, frontend 8081, htm `HTTP_PORT` from its `.env` (default 9001), agent-be 8000, agent-fe 8082. A service whose port is already in use is skipped.
-- Node services run on Node 18 from nvm (repos pin 18.12.1); agent-be runs via `uv run uvicorn`.
-- Env files are gitignored, so a worktree won't have them: if missing in an overridden directory, the script copies them from the `~/Projects` checkout.
-- Missing `node_modules` / `.venv` is an error unless `--install` is passed (runs `npm ci`, or `npm install` without a lockfile, / `uv sync`).
-- Logs and pids: `~/.cache/hireez-dev/{logs,pids}`. Override with `HIREEZ_DEV_STATE_DIR`; readiness timeout with `HIREEZ_READY_TIMEOUT` (seconds, default 300).
+To check if a service listens on its port: `lsof -nP -iTCP:<port> -sTCP:LISTEN`.
 
 ## Agent frontend without the SaaS frontend or proxy
 
@@ -98,7 +97,7 @@ Choose the target from what the task changes:
   LOCAL_TB_BACKEND=http://127.0.0.1:9004 npm run dev -- --config vite.local.config.ts --port 8083
   ```
 
-  The local htm-backend must be running on the branch with the change. Start it with `dev-stack.sh --only htm`, adding `--htm DIR` for a worktree. If the change is in `native-agent-backend`, run that locally too (`--only htm,agent-be`), because htm-backend reaches it through `NATIVE_AGENT_BE_URL=http://127.0.0.1:8000` in its `.env`. A change only in `native-agent-backend` still needs the local htm-backend, since that is the only path from the frontend to it.
+  The local htm-backend must be running on the branch with the change. Start it with the htm-backend command in "Startup commands", from the worktree directory if the change is in a worktree. If the change is in `native-agent-backend`, run that locally too with the native-agent-backend command, because htm-backend reaches it through `NATIVE_AGENT_BE_URL=http://127.0.0.1:8000` in its `.env`. A change only in `native-agent-backend` still needs the local htm-backend, since that is the only path from the frontend to it.
 
 To decide, check the task description or ticket, and check whether the same ticket has a branch or uncommitted changes in `htm-backend` or `native-agent-backend` (`git -C ~/Projects/<repo> branch --list '*<TICKET>*'`, `git -C ~/Projects/<repo> status --short`). If it's still unclear, ask the user.
 
