@@ -45,7 +45,7 @@ Follow this for every bug fix or feature modification.
 4. **Keep the two branches in sync.** Any follow-up fix goes onto the from-release branch first and is cherry-picked onto the from-develop branch (or vice versa), so both carry the same change.
 5. **Ship to production.** Once the change is tested and approved, PR the from-release branch into `master` (the production branch). Never PR the from-develop branch into `master`.
    - **Never do this step on your own.** Don't open or merge the `master` PR as part of finishing a task. Only do it when Xiang explicitly says to.
-6. A ticket may have subtasks for related bugs or tasks: The issues should be fixed in the main task's branch but commits related to the subtask should start with the subtask's ticket number
+6. **Subtasks and follow-up bug tickets reuse the original branch.** A ticket may have subtasks for related bugs or tasks. QA may also file a separate bug ticket against a change from an earlier ticket. Either way, the fix usually depends on the earlier ticket's code, which may not be in a release tag or in `develop` yet. Don't cut a new branch from the release tag or from `develop`. Commit on the earlier ticket's from-release branch, cherry-pick onto its from-develop branch as in step 4, and start each commit message with the new ticket's number, e.g. `HT5-46230 Keep the signature field when the offer is re-sent` on `xiangchen/HT5-46102`.
 
 ## Other branch names seen in the repos
 
