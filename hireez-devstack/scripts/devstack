@@ -1,0 +1,1175 @@
+#!/usr/bin/env python3
+"""devstack: run the HireEZ local stack in a background tmux session.
+
+Services: htm (htm-backend), nab (native-agent-backend), pa (ez-profile-agent),
+fe (native-agent-frontend). Each runs in its own window of a tmux session, so it
+outlives the terminal and the agent session that started it.
+
+Each ticket gets its own stack: session "devstack-<TICKET>", its own block of
+ports, state and logs. Without a ticket, the default stack keeps session
+"devstack" and the ports 8084/9004/8000/8765.
+
+Where each service points is worked out from which services run locally, and
+re-applied (with a restart) whenever that set changes. See
+~/.hireez-dev/docs/local-dev-stack.md for why each rule exists.
+"""
+from __future__ import annotations
+
+import argparse
+import configparser
+import json
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+HOME = Path.home()
+PROJECTS = HOME / "Projects"
+ROOT = HOME / ".hireez-dev"
+ENV_DIR = ROOT / "env"
+RUN_DIR = ROOT / "run"
+LOG_DIR = ROOT / "logs"
+SESSION = "devstack"
+TEMPLATES = Path(__file__).resolve().parent.parent / "templates" / "env"
+FE_SETUP = HOME / ".claude/skills/hireez-local-dev/scripts/agent-fe-https-setup.sh"
+
+AWS_PROFILE = "test-env"
+AWS_ENV = {"AWS_PROFILE": AWS_PROFILE, "AWS_SDK_LOAD_CONFIG": "1", "AWS_REGION": "us-west-2"}
+TEST2_TB = "https://api.test2.testhireez.com"
+TEST2_NAB = "https://nativeagentbe.test2.hireez.info"
+HTM_BACKUP = ".env.devstack-backup"
+HOSTS_NAME = "localhost.test2.testhireez.com"
+CERT = HOME / ".certs" / f"{HOSTS_NAME}.pem"
+
+ORDER = ["htm", "nab", "pa", "fe"]
+REPOS = {
+    "htm": "htm-backend",
+    "nab": "native-agent-backend",
+    "pa": "ez-profile-agent",
+    "fe": "native-agent-frontend",
+}
+FIXED_PORTS = {"nab": 8000, "pa": 8765, "fe": 8084}
+# A ticket stack in slot n listens on BASE_PORTS + n * SLOT_STEP; slot 0 is the default stack.
+BASE_PORTS = {"htm": 9004, "nab": 8000, "pa": 8765, "fe": 8084}
+SLOT_STEP = 10
+SLOTS = RUN_DIR / "slots.json"
+SPARE_DIR = ROOT / "checkouts"
+STACK_MB = 2000
+NODE = {"htm", "fe"}
+NVM = 'source "$HOME/.nvm/nvm.sh" && nvm use 18 >/dev/null'
+
+
+# ------------------------------------------------------------------ small helpers
+
+
+def sh(cmd: list[str], cwd: Path | None = None, timeout: float = 30) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        return subprocess.CompletedProcess(cmd, 127, "", str(e))
+
+
+QUIET = False  # --json: keep stdout for the one JSON document
+
+
+def say(msg: str = "") -> None:
+    if not QUIET:
+        print(msg, flush=True)
+
+
+# ------------------------------------------------------------------ stacks
+
+STACK: str | None = None  # the ticket whose stack this command acts on; None is the default stack
+CUR = object()
+
+
+def cur(t):
+    return STACK if t is CUR else t
+
+
+def label(t: str | None) -> str:
+    return t or "default"
+
+
+def session(t=CUR) -> str:
+    t = cur(t)
+    return f"devstack-{t}" if t else "devstack"
+
+
+def run_dir(t=CUR) -> Path:
+    t = cur(t)
+    return RUN_DIR / t if t else RUN_DIR
+
+
+def log_dir(t=CUR) -> Path:
+    t = cur(t)
+    return LOG_DIR / t if t else LOG_DIR
+
+
+def load_slots() -> dict[str, int]:
+    return json.loads(SLOTS.read_text()) if SLOTS.exists() else {}
+
+
+def slot_of(t: str | None, allocate: bool = False) -> int:
+    """The ticket's port block; a ticket without one reports the block it would get."""
+    if t is None:
+        return 0
+    slots = load_slots()
+    if t in slots:
+        return slots[t]
+    n = 1
+    while n in slots.values():
+        n += 1
+    if allocate:
+        slots[t] = n
+        RUN_DIR.mkdir(parents=True, exist_ok=True)
+        SLOTS.write_text(json.dumps(slots, indent=2))
+    return n
+
+
+def release_slot(t: str | None) -> None:
+    slots = load_slots()
+    if t in slots:
+        del slots[t]
+        SLOTS.write_text(json.dumps(slots, indent=2))
+
+
+def live_stacks() -> list[str | None]:
+    """Stacks with a tmux session, default first."""
+    r = sh(["tmux", "list-sessions", "-F", "#{session_name}"])
+    out: list[str | None] = []
+    for name in r.stdout.split():
+        if name == "devstack":
+            out.insert(0, None)
+        elif name.startswith("devstack-"):
+            out.append(name.removeprefix("devstack-"))
+    return out
+
+
+def read_env_file(path: Path) -> dict[str, str]:
+    out: dict[str, str] = {}
+    if not path.exists():
+        return out
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        out[k.strip()] = v.strip().strip('"').strip("'")
+    return out
+
+
+def branch_of(d: Path) -> str:
+    r = sh(["git", "-C", str(d), "branch", "--show-current"])
+    return r.stdout.strip() or "(detached)"
+
+
+def port_of(svc: str, d: Path, t=CUR) -> int:
+    t = cur(t)
+    if t is not None:
+        return BASE_PORTS[svc] + SLOT_STEP * slot_of(t)
+    if svc == "htm":
+        return int(read_env_file(d / HTM_BACKUP if (d / HTM_BACKUP).exists() else d / ".env").get("HTTP_PORT") or 9001)
+    return FIXED_PORTS[svc]
+
+
+def listeners(port: int) -> list[tuple[int, str]]:
+    r = sh(["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-Fpc"])
+    out, pid = [], None
+    for line in r.stdout.splitlines():
+        if line.startswith("p"):
+            pid = int(line[1:])
+        elif line.startswith("c") and pid is not None:
+            out.append((pid, line[1:]))
+    return out
+
+
+def cwd_of(pid: int) -> str:
+    r = sh(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"])
+    for line in r.stdout.splitlines():
+        if line.startswith("n"):
+            return line[1:]
+    return ""
+
+
+# ------------------------------------------------------------------ tmux
+
+
+def tmux(*args: str) -> subprocess.CompletedProcess:
+    return sh(["tmux", *args])
+
+
+def windows(t=CUR) -> dict[str, bool]:
+    """Window name -> whether its process is still alive."""
+    r = tmux("list-windows", "-t", f"={session(t)}", "-F", "#{window_name} #{pane_dead}")
+    if r.returncode != 0:
+        return {}
+    out = {}
+    for line in r.stdout.splitlines():
+        name, dead = line.rsplit(" ", 1)
+        out[name] = dead != "1"
+    return out
+
+
+def target(svc: str) -> str:
+    return f"={session()}:{svc}"
+
+
+def launch(svc: str) -> None:
+    """Run the service's script in its window, creating the window if needed.
+
+    The window starts on a placeholder so remain-on-exit is set before the real
+    command runs: a service that dies at once keeps its output on screen."""
+    script = str(run_dir() / f"{svc}.sh")
+    wins = windows()
+    if not wins and tmux("has-session", "-t", f"={session()}").returncode != 0:
+        tmux("new-session", "-d", "-s", session(), "-n", svc, "sleep 86400")
+    elif svc not in wins:
+        tmux("new-window", "-d", "-t", f"={session()}:", "-n", svc, "sleep 86400")
+    tmux("set-option", "-w", "-t", target(svc), "remain-on-exit", "on")
+    tmux("respawn-window", "-k", "-t", target(svc), f"/bin/bash {shlex.quote(script)}")
+
+
+def stop_window(svc: str, meta: dict | None) -> None:
+    tmux("kill-window", "-t", target(svc))
+    if not meta:
+        return
+    # npm and nest leave a node child holding the port after the window's shell
+    # goes; free it if (and only if) the holder runs from this service's checkout.
+    port, d = meta["port"], meta["dir"]
+    for _ in range(10):
+        held = listeners(port)
+        if not held:
+            return
+        time.sleep(0.5)
+    for pid, _cmd in listeners(port):
+        if cwd_of(pid).startswith(d):
+            sh(["kill", str(pid)])
+
+
+# ------------------------------------------------------------------ state
+
+
+def meta_path(svc: str, t=CUR) -> Path:
+    return run_dir(t) / f"{svc}.json"
+
+
+def load_meta(svc: str, t=CUR) -> dict | None:
+    p = meta_path(svc, t)
+    return json.loads(p.read_text()) if p.exists() else None
+
+
+def running(t=CUR) -> set[str]:
+    """Services with a live window (a dead window is not running)."""
+    return {s for s, alive in windows(t).items() if alive and s in REPOS}
+
+
+def present(t=CUR) -> set[str]:
+    return {s for s in windows(t) if s in REPOS}
+
+
+# ------------------------------------------------------------------ where each service runs from
+
+
+def worktrees(repo: str) -> list[tuple[Path, str]]:
+    """(path, branch) of each live worktree; a detached one has branch "(detached)"."""
+    r = sh(["git", "-C", str(PROJECTS / repo), "worktree", "list", "--porcelain"])
+    out, path = [], None
+    for line in r.stdout.splitlines():
+        if line.startswith("worktree "):
+            path = Path(line.split(" ", 1)[1])
+        elif line.startswith("branch ") and path is not None:
+            out.append((path, line.split(" ", 1)[1].removeprefix("refs/heads/")))
+        elif line == "detached" and path is not None:
+            out.append((path, "(detached)"))
+    return [(p, b) for p, b in out if p.exists()]
+
+
+def resolve_dir(svc: str, ticket: str | None, overrides: dict[str, Path]) -> tuple[Path, str]:
+    """The checkout to run, and why it was picked."""
+    if svc in overrides:
+        return overrides[svc], "given with --dir"
+    main = PROJECTS / REPOS[svc]
+    if ticket:
+        t = ticket.lower()
+        hits = [(p, b) for p, b in worktrees(REPOS[svc])
+                if (t in b.lower() or t in str(p).lower()) and not p.is_relative_to(SPARE_DIR)]
+        workspace = PROJECTS / "tickets"
+        # A T3 ticket workspace (~/Projects/tickets/<T>/<repo>) first, the main checkout last.
+        hits.sort(key=lambda h: (not h[0].is_relative_to(workspace), h[0] == main))
+        if hits:
+            why = f"branch {hits[0][1]}"
+            if len(hits) > 1:
+                others = ", ".join(str(p) for p, _ in hits[1:])
+                why += f"; also matches {others} (pick one with --dir {svc}=PATH)"
+            return hits[0][0], why
+        return main, f"no {ticket} branch, main checkout on {branch_of(main)}"
+    meta = load_meta(svc)
+    if meta and Path(meta["dir"]).exists():
+        return Path(meta["dir"]), "same checkout as last run"
+    return main, f"main checkout on {branch_of(main)}"
+
+
+# ------------------------------------------------------------------ what each service points at
+
+
+def local_nab() -> str:
+    return f"http://127.0.0.1:{port_of('nab', PROJECTS)}"
+
+
+def links(svc: str, local: set[str], d: Path, flags: dict) -> dict[str, str]:
+    """The values that depend on which services run locally."""
+    if svc == "htm":
+        return {"NATIVE_AGENT_BE_URL": local_nab() if "nab" in local else TEST2_NAB}
+    if svc == "nab":
+        return {"EZ_PROFILE_MCP_URL": f"http://127.0.0.1:{port_of('pa', PROJECTS)}/mcp"} if "pa" in local else {}
+    if svc == "pa":
+        out = {"NATIVE_AGENT_BACKEND_URL": local_nab()} if "nab" in local else {}
+        if flags.get("memory"):
+            out["DEVSTACK_MEMORY"] = "1"
+        return out
+    if svc == "fe":
+        if "htm" in local:
+            htm = load_meta("htm")
+            port = htm["port"] if htm else port_of("htm", PROJECTS / REPOS["htm"])
+            return {"LOCAL_TB_BACKEND": f"http://127.0.0.1:{port}"}
+        return {"LOCAL_TB_BACKEND": TEST2_TB}
+    return {}
+
+
+def process_env(svc: str, link: dict[str, str]) -> dict[str, str]:
+    env = {} if svc == "fe" else dict(AWS_ENV)
+    env.update(read_env_file(ENV_DIR / f"{svc}.env"))
+    if STACK:  # a ticket's own overrides, e.g. its own AGENT_DB_URL
+        env.update(read_env_file(ENV_DIR / STACK / f"{svc}.env"))
+    env.update({k: v for k, v in link.items() if k != "DEVSTACK_MEMORY"})
+    if svc == "pa" and link.get("DEVSTACK_MEMORY"):
+        env = {k: v for k, v in env.items() if not k.endswith("_SM")}
+    if svc == "htm":
+        env.pop("NATIVE_AGENT_BE_URL", None)  # htm reads it from .env only
+    return env
+
+
+def set_htm_env(d: Path, values: dict[str, str]) -> None:
+    """htm-backend reads only its .env when one exists, so its link (and a ticket
+    stack's port) is written there. The first change keeps the original as
+    HTM_BACKUP for `down`."""
+    env, backup = d / ".env", d / HTM_BACKUP
+    text = env.read_text()
+    new = text
+    for key, value in values.items():
+        line = f"{key}={value}"
+        if re.search(rf"^{key}=.*$", new, flags=re.M):
+            new = re.sub(rf"^{key}=.*$", line, new, flags=re.M)
+        else:
+            new = new.rstrip("\n") + "\n" + line + "\n"
+    if new == text:
+        return
+    if not backup.exists():
+        shutil.copy2(env, backup)
+    env.write_text(new)
+
+
+def restore_htm_env(d: Path) -> bool:
+    backup = d / HTM_BACKUP
+    if backup.exists():
+        shutil.move(backup, d / ".env")
+        return True
+    return False
+
+
+# ------------------------------------------------------------------ run scripts
+
+
+def command(svc: str, port: int) -> list[str]:
+    """Shell lines: install what is missing, then exec the server."""
+    if svc == "htm":
+        return [NVM, "[ -d node_modules ] || npm ci --no-audit --no-fund", "exec npm run start:dev"]
+    if svc == "nab":
+        return [
+            "[ -x .venv/bin/uvicorn ] || uv sync --python 3.13",
+            f"exec .venv/bin/uvicorn app.main:app --reload --port {port} --app-dir src",
+        ]
+    if svc == "pa":
+        return ["exec uv run --python 3.13 python -m ez_profile_agent mcp"]
+    if svc == "fe":
+        return [
+            NVM,
+            "[ -d node_modules ] || npm ci --no-audit --no-fund",
+            f"exec npm run dev -- --config vite.local.config.ts --port {port}",
+        ]
+    raise ValueError(svc)
+
+
+def write_run(svc: str, d: Path, port: int, link: dict[str, str], flags: dict) -> None:
+    run_dir().mkdir(parents=True, exist_ok=True)
+    log_dir().mkdir(parents=True, exist_ok=True)
+    log = log_dir() / f"{svc}.log"
+    env = process_env(svc, link)
+    if svc == "pa":
+        env["MCP_PORT"] = str(port)
+    lines = [
+        "#!/bin/bash",
+        f"# generated by devstack for {svc}; rewritten on every up/restart",
+        f"cd {shlex.quote(str(d))} || exit 1",
+        f"exec > >(tee -a {shlex.quote(str(log))}) 2>&1",
+        f'echo "[devstack] {svc} starting $(date "+%F %T") in {d} ({branch_of(d)})"',
+    ]
+    lines += [f"export {k}={shlex.quote(v)}" for k, v in sorted(env.items())]
+    lines += command(svc, port)
+    (run_dir() / f"{svc}.sh").write_text("\n".join(lines) + "\n")
+    meta = {"dir": str(d), "port": port, "links": link, "flags": flags, "started": time.strftime("%F %T")}
+    meta_path(svc).write_text(json.dumps(meta, indent=2))
+
+
+def start(svc: str, d: Path, local: set[str], flags: dict) -> None:
+    link = links(svc, local, d, flags)
+    port = port_of(svc, d)
+    if svc == "htm":
+        values = {"NATIVE_AGENT_BE_URL": link["NATIVE_AGENT_BE_URL"]}
+        if STACK is not None:
+            values["HTTP_PORT"] = str(port)
+        set_htm_env(d, values)
+    write_run(svc, d, port, link, flags)
+    launch(svc)
+
+
+def reconcile(skip: set[str]) -> None:
+    """Restart running services whose links no longer match the local set."""
+    local = present()
+    for svc in ORDER:
+        if svc not in local or svc in skip:
+            continue
+        meta = load_meta(svc)
+        if not meta:
+            continue
+        d = Path(meta["dir"])
+        want = links(svc, local, d, meta.get("flags", {}))
+        if want != meta.get("links"):
+            say(f"  {svc}: restarting so it points at {fmt_links(want) or 'its defaults'}")
+            start(svc, d, local, meta.get("flags", {}))
+
+
+def fmt_links(link: dict[str, str]) -> str:
+    return ", ".join(f"{k}={v}" for k, v in link.items() if k != "DEVSTACK_MEMORY")
+
+
+# ------------------------------------------------------------------ checks
+
+
+class Report:
+    def __init__(self) -> None:
+        self.errors: list[str] = []
+        self.fixes: list[str] = []
+        self.checks: list[dict] = []
+
+    def record(self, ok: bool, msg: str, fix: str | None = None) -> None:
+        slug = re.sub(r"[^a-z0-9]+", "-", msg.lower()).strip("-")[:48]
+        self.checks.append({"id": f"{len(self.checks)}-{slug}", "ok": ok, "message": msg, "fix": fix})
+
+    def ok(self, msg: str) -> None:
+        self.record(True, msg)
+        say(f"  ok    {msg}")
+
+    def warn(self, msg: str) -> None:
+        self.record(True, f"warning: {msg}")
+        say(f"  warn  {msg}")
+
+    def fail(self, msg: str, fix: str | None = None) -> None:
+        self.record(False, msg, fix)
+        say(f"  FAIL  {msg}")
+        self.errors.append(msg)
+        if fix:
+            self.fixes.append(fix)
+
+
+def sso_expiry() -> datetime | None:
+    """When the SSO token behind AWS_PROFILE expires, or None if there is none.
+
+    `aws sts get-caller-identity` is not the check: the CLI answers from role
+    credentials it cached, and keeps answering after the SSO token is gone,
+    while boto3 and the Node SDK need the token itself (TokenRetrievalError)."""
+    cfg = configparser.ConfigParser()
+    cfg.read(HOME / ".aws/config")
+    prof = cfg[f"profile {AWS_PROFILE}"] if cfg.has_section(f"profile {AWS_PROFILE}") else {}
+    session = prof.get("sso_session")
+    url = prof.get("sso_start_url")
+    if session and cfg.has_section(f"sso-session {session}"):
+        url = cfg[f"sso-session {session}"].get("sso_start_url")
+    latest = None
+    for f in (HOME / ".aws/sso/cache").glob("*.json"):
+        try:
+            d = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if d.get("startUrl") != url or "expiresAt" not in d:
+            continue
+        at = datetime.fromisoformat(d["expiresAt"].replace("Z", "+00:00"))
+        latest = at if latest is None or at > latest else latest
+    return latest
+
+
+def check_aws(rep: Report, svcs: list[str]) -> None:
+    at = sso_expiry()
+    now = datetime.now(timezone.utc)
+    fix = f"aws sso login --profile {AWS_PROFILE}"
+    if svcs == ["pa"]:
+        fix += "   (or run pa without AWS: devstack up --memory pa)"
+    if at is None:
+        rep.fail(f"no AWS SSO login for {AWS_PROFILE}", fix)
+    elif at <= now + timedelta(minutes=10):
+        rep.fail(f"AWS SSO login for {AWS_PROFILE} expired (or expires within 10 min) at {at:%F %T}Z", fix)
+    else:
+        left = at - now
+        rep.ok(f"AWS SSO login for {AWS_PROFILE} valid for {left.seconds // 3600 + left.days * 24}h{left.seconds // 60 % 60:02d}m")
+
+
+def check_service(svc: str, d: Path, why: str, rep: Report, mine: set[str]) -> None:
+    say(f"{svc}  {d}  ({why})")
+    if not d.exists():
+        rep.fail(f"{svc}: {d} does not exist")
+        return
+    main = PROJECTS / REPOS[svc]
+    if svc in ("htm", "nab"):
+        if (d / ".env").exists():
+            rep.ok(".env present")
+        elif (main / ".env").exists() and d != main:
+            rep.warn(f".env missing; up copies it from {main}")
+        else:
+            rep.fail(f"{svc}: no .env in {d} or {main}")
+    if svc in NODE:
+        installed = d / "node_modules" / ".package-lock.json"
+        lock = d / "package-lock.json"
+        if not (d / "node_modules").exists():
+            rep.warn("node_modules missing; the first start runs npm ci (a few minutes)")
+        elif installed.exists() and lock.exists() and lock.stat().st_mtime > installed.stat().st_mtime + 60:
+            rep.warn(f"node_modules is older than package-lock.json; if it fails to compile, run: cd {d} && npm ci")
+        else:
+            rep.ok("node_modules present")
+    if svc == "nab":
+        has = (d / ".venv/bin/uvicorn").exists()
+        (rep.ok if has else rep.warn)(".venv present" if has else ".venv missing; the first start runs uv sync --python 3.13")
+    if svc == "htm":
+        sh(["git", "-C", str(d), "fetch", "-q", "origin", "master"], timeout=30)
+        behind = sh(["git", "-C", str(d), "rev-list", "--count", "HEAD..origin/master"]).stdout.strip()
+        if behind and behind != "0":
+            rep.warn(f"{behind} commits behind origin/master; pull, or run from a worktree on origin/master")
+        else:
+            rep.ok("up to date with origin/master")
+    if svc == "fe":
+        if (d / "vite.local.config.ts").exists():
+            rep.ok("vite.local.config.ts present")
+        else:
+            rep.warn("vite.local.config.ts missing; up runs agent-fe-https-setup.sh")
+    port = port_of(svc, d)
+    held = listeners(port)
+    if not held:
+        rep.ok(f"port {port} free")
+    elif svc in mine:
+        rep.ok(f"port {port} held by devstack's own {svc}")
+    else:
+        who = ", ".join(f"{c} (pid {p}, {cwd_of(p) or '?'})" for p, c in held)
+        rep.fail(f"{svc}: port {port} is taken by {who}", f"kill {' '.join(str(p) for p, _ in held)}")
+
+
+def check_global(svcs: list[str], rep: Report) -> None:
+    say("machine")
+    (rep.ok if shutil.which("tmux") else rep.fail)("tmux installed" if shutil.which("tmux") else "tmux is not installed")
+    if any(s != "fe" for s in svcs):
+        check_aws(rep, [s for s in svcs if s != "fe"])
+    if any(s in NODE for s in svcs):
+        if list((HOME / ".nvm/versions/node").glob("v18*")):
+            rep.ok("Node 18 available through nvm")
+        else:
+            rep.fail("Node 18 is not installed in nvm", "nvm install 18.12.1")
+    if any(s in ("nab", "pa") for s in svcs):
+        (rep.ok if shutil.which("uv") else rep.fail)("uv installed" if shutil.which("uv") else "uv is not installed")
+    if "fe" in svcs:
+        if HOSTS_NAME in Path("/etc/hosts").read_text():
+            rep.ok(f"/etc/hosts has {HOSTS_NAME}")
+        else:
+            rep.fail(f"/etc/hosts has no {HOSTS_NAME}", f"echo '127.0.0.1 {HOSTS_NAME}' | sudo tee -a /etc/hosts")
+        if CERT.exists():
+            rep.ok(f"certificate {CERT.name} present")
+        else:
+            rep.fail("mkcert certificate missing", f"mkdir -p ~/.certs && cd ~/.certs && mkcert -install && mkcert {HOSTS_NAME}")
+
+
+def run_checks(svcs: list[str], dirs: dict[str, tuple[Path, str]]) -> Report:
+    rep = Report()
+    mine = running()
+    check_global(svcs, rep)
+    for svc in svcs:
+        check_service(svc, dirs[svc][0], dirs[svc][1], rep, mine)
+    return rep
+
+
+# ------------------------------------------------------------------ preparing a checkout
+
+
+def prepare(svc: str, d: Path) -> None:
+    main = PROJECTS / REPOS[svc]
+    if svc in ("htm", "nab") and not (d / ".env").exists() and d != main and (main / ".env").exists():
+        src = main / HTM_BACKUP if svc == "htm" and (main / HTM_BACKUP).exists() else main / ".env"
+        shutil.copy2(src, d / ".env")
+        say(f"  {svc}: copied .env from {main}")
+    if svc == "fe" and not (d / "vite.local.config.ts").exists():
+        say(f"  fe: running {FE_SETUP.name}")
+        r = sh(["bash", str(FE_SETUP), str(d)], timeout=120)
+        if r.returncode != 0:
+            say(r.stdout[-2000:] + r.stderr[-2000:])
+            raise SystemExit("fe: setup script failed")
+
+
+def htm_held_by(d: Path) -> str | None:
+    """The other stack whose htm runs from d. htm takes its port and nab link from
+    .env and builds into dist/, so one checkout cannot serve two stacks."""
+    for t in live_stacks():
+        if t == STACK:
+            continue
+        meta = load_meta("htm", t)
+        if meta and Path(meta["dir"]) == d and "htm" in present(t):
+            return label(t)
+    return None
+
+
+def spare_htm(d: Path) -> Path:
+    """A worktree of htm-backend at d's commit for this stack alone, reusing d's
+    .env and an APFS clone of its node_modules."""
+    spare = SPARE_DIR / label(STACK) / REPOS["htm"]
+    head = sh(["git", "-C", str(d), "rev-parse", "HEAD"]).stdout.strip()
+    main = PROJECTS / REPOS["htm"]
+    if not spare.exists():
+        spare.parent.mkdir(parents=True, exist_ok=True)
+        r = sh(["git", "-C", str(main), "worktree", "add", "--detach", str(spare), head], timeout=120)
+        if r.returncode != 0:
+            raise SystemExit(f"htm: could not create {spare}: {r.stderr.strip()}")
+        env = d / HTM_BACKUP if (d / HTM_BACKUP).exists() else d / ".env"
+        if env.exists():
+            shutil.copy2(env, spare / ".env")
+        if (d / "node_modules").exists():
+            say(f"  htm: cloning node_modules from {d}")
+            sh(["cp", "-cR", str(d / "node_modules"), str(spare / "node_modules")], timeout=600)
+    elif sh(["git", "-C", str(spare), "rev-parse", "HEAD"]).stdout.strip() != head:
+        sh(["git", "-C", str(spare), "checkout", "-q", "--detach", head])
+    if sh(["git", "-C", str(d), "status", "--porcelain", "--untracked-files=no"]).stdout.strip():
+        say(f"  htm: {d} has uncommitted changes; the separate checkout runs its last commit only")
+    return spare
+
+
+def drop_spare(d: Path) -> None:
+    if d.is_relative_to(SPARE_DIR):
+        sh(["git", "-C", str(PROJECTS / REPOS["htm"]), "worktree", "remove", "--force", str(d)], timeout=120)
+        say(f"  htm: removed the separate checkout {d}")
+        if d.parent.exists() and not any(d.parent.iterdir()):
+            d.parent.rmdir()
+
+
+def seed_env_files() -> None:
+    ENV_DIR.mkdir(parents=True, exist_ok=True)
+    for t in TEMPLATES.glob("*.env"):
+        dest = ENV_DIR / t.name
+        if not dest.exists():
+            shutil.copy2(t, dest)
+
+
+# ------------------------------------------------------------------ waiting for ports
+
+
+# A service that failed but whose process stays up: uvicorn --reload keeps its
+# reloader after the app fails, and nest --watch waits for the next file change.
+FAILED = {
+    "htm": [r"Found [1-9]\d* errors?\. Watching", r"EADDRINUSE"],
+    "nab": [r"Application startup failed", r"address already in use"],
+    # pa logs (and survives) tracebacks such as an expired AWS token, so only fatal lines count.
+    "pa": [r"Application startup failed", r"address already in use"],
+    "fe": [r"error when starting dev server", r"EADDRINUSE"],
+}
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def this_run(svc: str, t=CUR) -> list[str]:
+    """Log lines since the service's last start."""
+    log = log_dir(t) / f"{svc}.log"
+    if not log.exists():
+        return []
+    lines = [ANSI.sub("", l) for l in log.read_text(errors="replace").splitlines()]
+    marker = f"[devstack] {svc} starting"
+    starts = [i for i, l in enumerate(lines) if marker in l]
+    return lines[starts[-1]:] if starts else lines
+
+
+def failure(svc: str) -> str | None:
+    for line in this_run(svc):
+        for pat in FAILED[svc]:
+            if re.search(pat, line):
+                return reason(line)
+    return None
+
+
+def reason(line: str) -> str:
+    """The readable part of a log line: a JSON log's message, cut short."""
+    if line.startswith("{"):
+        try:
+            line = json.loads(line).get("message", line).splitlines()[-1]
+        except ValueError:
+            pass
+    return line.strip()[:240]
+
+
+def state_of(svc: str, port: int, alive: bool) -> str:
+    if listeners(port):
+        return "up"
+    if not alive:
+        return "EXITED"
+    return "FAILED" if failure(svc) else "starting"
+
+
+def wait_ready(svcs: list[str], timeout: float) -> None:
+    pending = {s: load_meta(s)["port"] for s in svcs}
+    deadline = time.time() + timeout
+    while pending and time.time() < deadline:
+        alive = windows()
+        for svc, port in list(pending.items()):
+            state = state_of(svc, port, alive.get(svc, False))
+            if state == "up":
+                say(f"  {svc}: listening on {port}")
+            elif state in ("EXITED", "FAILED"):
+                say(f"  {svc}: {state}. {failure(svc) or ''}\n  last lines (`devstack logs {svc}` for more):")
+                say(tail(svc, 12))
+            else:
+                continue
+            del pending[svc]
+        time.sleep(2)
+    for svc, port in pending.items():
+        say(f"  {svc}: not listening on {port} after {timeout}s; see `devstack logs {svc}`")
+
+
+def tail(svc: str, n: int) -> str:
+    lines = this_run(svc)[-n:]
+    if not lines:
+        return "    (no log yet)"
+    return "\n".join("    " + reason(l) for l in lines)
+
+
+# ------------------------------------------------------------------ commands
+
+
+TICKET_KEY = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b")
+
+
+def infer_ticket() -> str | None:
+    """The ticket of the current directory: its path, then its git branch.
+
+    Lets T3 Code actions, which run at the project root without arguments, pick the right worktrees."""
+    cwd = Path.cwd()
+    hit = TICKET_KEY.search(str(cwd))
+    if hit:
+        return hit.group(1)
+    hit = TICKET_KEY.search(branch_of(cwd) or "")
+    return hit.group(1) if hit else None
+
+
+def stack_running_here() -> tuple[bool, str | None]:
+    """The live stack that runs a service from the current checkout, if any.
+
+    Without --ticket this wins over the ticket in the path or branch: the default
+    stack often runs checkouts on ticket branches, and `devstack restart nab` there
+    means that running nab."""
+    top = sh(["git", "rev-parse", "--show-toplevel"]).stdout.strip()
+    if not top:
+        return False, None
+    here = Path(top).resolve()
+    for t in live_stacks():
+        for svc in present(t):
+            meta = load_meta(svc, t)
+            if meta and Path(meta["dir"]).resolve() == here:
+                return True, t
+    return False, None
+
+
+def parse_dirs(values: list[str]) -> dict[str, Path]:
+    out = {}
+    for v in values or []:
+        svc, _, path = v.partition("=")
+        if svc not in REPOS or not path:
+            raise SystemExit(f"--dir takes svc=path with svc in {', '.join(ORDER)}: {v}")
+        out[svc] = Path(path).expanduser().resolve()
+    return out
+
+
+def pick(svcs: list[str]) -> list[str]:
+    svcs = [s for s in svcs if s]  # tools fill an empty {service} for "all"
+    bad = [s for s in svcs if s not in REPOS]
+    if bad:
+        raise SystemExit(f"unknown service {', '.join(bad)}; use {', '.join(ORDER)}")
+    return [s for s in ORDER if s in svcs]
+
+
+def cmd_doctor(a: argparse.Namespace) -> int:
+    svcs = pick(a.services or ORDER)
+    overrides = parse_dirs(a.dir)
+    dirs = {s: resolve_dir(s, STACK, overrides) for s in svcs}
+    if "htm" in dirs and htm_held_by(dirs["htm"][0]):
+        d = dirs["htm"][0]
+        say(f"htm: {d} runs the {htm_held_by(d)} stack's htm; `up` runs this stack's htm from a separate checkout")
+        svcs = [s for s in svcs if s != "htm"]
+    rep = run_checks(svcs, dirs)
+    if a.json:
+        print(json.dumps({"checks": rep.checks}))
+        return 0
+    say()
+    if rep.errors:
+        say(f"{len(rep.errors)} problem(s). Fix with:")
+        for f in rep.fixes:
+            say(f"  {f}")
+        return 1
+    say("All checks passed.")
+    return 0
+
+
+def cmd_up(a: argparse.Namespace) -> int:
+    svcs = pick(a.services)
+    if not svcs:
+        raise SystemExit("name the services to start: devstack up htm nab pa fe")
+    seed_env_files()
+    overrides = parse_dirs(a.dir)
+    dirs = {s: resolve_dir(s, STACK, overrides) for s in svcs}
+    slot_of(STACK, allocate=True)
+    if "htm" in dirs:
+        holder = htm_held_by(dirs["htm"][0])
+        if holder:
+            d = dirs["htm"][0]
+            dirs["htm"] = (spare_htm(d), f"{d} runs the {holder} stack's htm; a separate checkout at its commit")
+
+    others = [t for t in live_stacks() if t != STACK and running(t)]
+    if len(others) >= 2:
+        say(f"  warn  {', '.join(label(t) for t in others)} are already running; each stack takes about "
+            f"{STACK_MB // 1000} GB. Stop one with: devstack down --ticket <TICKET>")
+
+    rep = run_checks(svcs, dirs)
+    if rep.errors:
+        # stderr, so tools that show only the error stream still show the fix.
+        print("Not starting: " + "; ".join(rep.errors) + "\nFix with:", file=sys.stderr)
+        for f in rep.fixes:
+            print(f"  {f}", file=sys.stderr)
+        return 1
+
+    # A service already running from another checkout is replaced, once the checks pass.
+    for svc in svcs:
+        meta = load_meta(svc)
+        if svc in present() and meta and meta["dir"] != str(dirs[svc][0]):
+            say(f"  {svc}: switching from {meta['dir']}")
+            stop_window(svc, meta)
+            if svc == "htm":
+                restore_htm_env(Path(meta["dir"]))
+                drop_spare(Path(meta["dir"]))
+
+    say(f"\nstarting the {label(STACK)} stack")
+    local = present() | set(svcs)
+    flags = {"memory": bool(a.memory)}
+    for svc in svcs:
+        d = dirs[svc][0]
+        prepare(svc, d)
+        start(svc, d, local, flags if svc == "pa" else {})
+        say(f"  {svc}: {d} ({branch_of(d)}) {fmt_links(links(svc, local, d, flags))}")
+    reconcile(skip=set(svcs))
+
+    if a.no_wait:
+        say("\nStarted in the background. `devstack status` shows when each is listening.")
+    else:
+        say(f"\nwaiting up to {a.timeout}s for ports")
+        wait_ready(svcs, a.timeout)
+    print_links()
+    return 0
+
+
+def cmd_down(a: argparse.Namespace) -> int:
+    svcs = pick(a.services) or [s for s in ORDER if s in present()]
+    if not svcs:
+        say(f"Nothing is running in the {label(STACK)} stack.")
+        say_other_stacks()
+        return 0
+    for svc in svcs:
+        meta = load_meta(svc)
+        stop_window(svc, meta)
+        say(f"  {svc}: stopped")
+        if svc == "htm" and meta and restore_htm_env(Path(meta["dir"])):
+            say(f"  htm: restored {meta['dir']}/.env")
+        if svc == "htm" and meta:
+            drop_spare(Path(meta["dir"]))
+    if not present():
+        tmux("kill-session", "-t", f"={session()}")
+        release_slot(STACK)
+    else:
+        reconcile(skip=set())
+    return 0
+
+
+def cmd_restart(a: argparse.Namespace) -> int:
+    svcs = pick(a.services)
+    local = present()
+    for svc in svcs:
+        meta = load_meta(svc)
+        if not meta:
+            say(f"  {svc}: never started; use `devstack up {svc}`")
+            continue
+        stop_window(svc, meta)
+        start(svc, Path(meta["dir"]), local | {svc}, meta.get("flags", {}))
+        say(f"  {svc}: restarted")
+    if not a.no_wait:
+        wait_ready([s for s in svcs if load_meta(s)], a.timeout)
+    return 0
+
+
+STATE_JSON = {"up": "running", "starting": "starting", "FAILED": "failed", "EXITED": "failed"}
+# The one variable that says where each service sends its requests, and the service it names.
+LINK_VARS = {
+    "fe": ("LOCAL_TB_BACKEND", "htm"),
+    "htm": ("NATIVE_AGENT_BE_URL", "nab"),
+    "nab": ("EZ_PROFILE_MCP_URL", "pa"),
+    "pa": ("NATIVE_AGENT_BACKEND_URL", "nab"),
+}
+
+
+def targets_of(svc: str, link: dict[str, str]) -> list[dict]:
+    """Where svc points: the local service, or test2 when the URL is not on this machine."""
+    var, to = LINK_VARS[svc]
+    value = link.get(var) or process_env(svc, link).get(var)
+    if not value:
+        return []
+    if "127.0.0.1" in value or "localhost:" in value:
+        return [{"to": to, "via": var}]
+    return [{"to": "test2", "via": var, "external": True}]
+
+
+def stack_summary(t: str | None) -> dict:
+    fe = load_meta("fe", t)
+    up = running(t)
+    return {
+        "id": label(t),
+        "label": t or "no ticket",
+        "running": len(up),
+        "url": f"https://{HOSTS_NAME}:{fe['port']}/agent/" if fe and "fe" in up else None,
+    }
+
+
+def status_json(ticket: str | None = None) -> dict:
+    """Shape shared with the T3 Code services panel; keep field names stable.
+
+    Reports the current stack; a stopped service reports the checkout `up` would run.
+    `others` summarizes the other stacks running on this machine."""
+    wins = windows()
+    at = sso_expiry()
+    sso_expired = at is None or at <= datetime.now(timezone.utc)
+    out = []
+    # Request order, browser-facing first: the panel draws the chain from the first service.
+    for svc in ["fe", "htm", "nab", "pa"]:
+        meta = (load_meta(svc) or {}) if svc in wins else {}
+        d = Path(meta["dir"]) if meta.get("dir") else None
+        want = resolve_dir(svc, ticket, {})[0] if ticket else None
+        if svc not in wins:
+            d = want or PROJECTS / REPOS[svc]
+        port = meta.get("port") or port_of(svc, d)
+        if svc in wins:
+            state = state_of(svc, port or 0, wins[svc])
+            detail = [fmt_links(meta.get("links", {}))]
+            if svc == "htm" and d and (d / HTM_BACKUP).exists():
+                detail.append(".env changed by devstack")
+            if state in ("EXITED", "FAILED"):
+                detail.insert(0, failure(svc) or "process exited")
+            if want is not None and d is not None and want != d:
+                detail.insert(0, f"not {ticket}'s checkout ({want}); Stop, then Start to switch")
+            if sso_expired and svc != "fe" and not meta.get("flags", {}).get("memory"):
+                detail.insert(0, f"AWS SSO expired: run aws sso login --profile {AWS_PROFILE}")
+            lines = this_run(svc)
+            entry = {
+                "state": STATE_JSON.get(state, "starting"),
+                "detail": "; ".join(x for x in detail if x) or None,
+                "lastLog": reason(lines[-1]) if lines else None,
+            }
+        else:
+            entry = {"state": "stopped", "detail": None, "lastLog": None}
+        # A stopped service reports where it would point if started now.
+        link = meta.get("links", {}) if svc in wins else links(svc, present() | {svc}, d or PROJECTS, {})
+        entry["targets"] = targets_of(svc, link)
+        url = None
+        if port and entry["state"] != "stopped":
+            url = f"https://{HOSTS_NAME}:{port}/agent/" if svc == "fe" else f"http://127.0.0.1:{port}"
+        out.append({
+            "id": svc,
+            "name": REPOS[svc],
+            "port": port,
+            "url": url,
+            "cwd": str(d) if d else None,
+            "branch": (branch_of(d) or None) if d and d.exists() else None,
+            "ticket": STACK,
+            **entry,
+        })
+    others = [stack_summary(t) for t in live_stacks() if t != STACK]
+    return {"services": out, "others": [o for o in others if o["running"]]}
+
+
+def say_other_stacks() -> None:
+    others = [stack_summary(t) for t in live_stacks() if t != STACK]
+    others = [o for o in others if o["running"]]
+    if others:
+        say("other stacks: " + ", ".join(f"{o['label']} ({o['running']} running)" for o in others)
+            + "   (`devstack ls` lists them)")
+
+
+def cmd_status(a: argparse.Namespace) -> int:
+    if a.json:
+        print(json.dumps(status_json(STACK)))
+        return 0
+    wins = windows()
+    if not wins:
+        say(f"Nothing is running in the {label(STACK)} stack.")
+        say_other_stacks()
+        return 0
+    say(f"{label(STACK)} stack (tmux session {session()})")
+    say(f"{'svc':4} {'state':9} {'port':5} {'branch':34} dir")
+    for svc in ORDER:
+        if svc not in wins:
+            continue
+        meta = load_meta(svc) or {}
+        port = meta.get("port", 0)
+        state = state_of(svc, port, wins[svc])
+        d = Path(meta.get("dir", "?"))
+        say(f"{svc:4} {state:9} {port:<5} {branch_of(d)[:34]:34} {d}")
+        link = fmt_links(meta.get("links", {}))
+        if link:
+            say(f"     -> {link}")
+        if svc == "pa" and meta.get("flags", {}).get("memory"):
+            say("     -> in-memory store (no test2 database)")
+        if svc == "htm" and (d / HTM_BACKUP).exists():
+            say(f"     -> .env changed by devstack (original in {HTM_BACKUP}; `devstack down htm` restores it)")
+        if state in ("EXITED", "FAILED"):
+            say(f"     !! {failure(svc) or 'process exited'}")
+        elif state != "up":
+            say(tail(svc, 2))
+    print_links()
+    say_other_stacks()
+    return 0
+
+
+def cmd_ls(a: argparse.Namespace) -> int:
+    stacks = live_stacks()
+    if a.json:
+        print(json.dumps({"stacks": [stack_summary(t) for t in stacks]}))
+        return 0
+    if not stacks:
+        say("No stack is running.")
+        return 0
+    for t in stacks:
+        o = stack_summary(t)
+        up = " ".join(s for s in ORDER if s in running(t))
+        say(f"{o['label']:14} {up or '(stopped)':16} {o['url'] or ''}")
+    return 0
+
+
+def cmd_logs(a: argparse.Namespace) -> int:
+    log = log_dir() / f"{pick([a.service])[0]}.log"
+    if not log.exists():
+        say(f"No log yet at {log}")
+        return 1
+    args = ["tail", "-n", str(a.lines)] + (["-f"] if a.follow else []) + [str(log)]
+    if not a.pretty:
+        return subprocess.call(args)
+    if not shutil.which("jq"):
+        say("--pretty needs jq: brew install jq")
+        return 1
+    color = "true" if sys.stdout.isatty() and not a.no_color else "false"
+    jq = ["jq", "-Rr", "--unbuffered", "--argjson", "color", color,
+          "-f", str(Path(__file__).resolve().parent / "pretty-log.jq")]
+    tail = subprocess.Popen(args, stdout=subprocess.PIPE)
+    try:
+        return subprocess.call(jq, stdin=tail.stdout)
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        tail.terminate()
+
+
+def print_links() -> None:
+    fe = load_meta("fe")
+    if fe and "fe" in present():
+        say(f"\nfrontend: https://{HOSTS_NAME}:{fe['port']}/agent/")
+    say(f"attach:   tmux attach -t {session()}   (Ctrl-b n / p to switch windows, Ctrl-b d to leave)")
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="devstack", description=__doc__.split("\n\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def common(sp, services_nargs="*"):
+        sp.add_argument("services", nargs=services_nargs, help="any of htm nab pa fe")
+        sp.add_argument("--ticket", help="the ticket's stack, run from its worktrees (default: from the current directory)")
+        sp.add_argument("--dir", action="append", metavar="SVC=PATH", help="run a service from this checkout")
+
+    sp = sub.add_parser("doctor", help="check prerequisites; changes nothing")
+    common(sp)
+    sp.add_argument("--json", action="store_true", help='print {"checks": [...]} for tools')
+    sp.set_defaults(fn=cmd_doctor)
+
+    sp = sub.add_parser("up", help="start services in the background")
+    common(sp, "+")
+    sp.add_argument("--memory", action="store_true", help="pa: in-memory store instead of the test2 database")
+    sp.add_argument("--no-wait", action="store_true")
+    sp.add_argument("--timeout", type=int, default=180)
+    sp.set_defaults(fn=cmd_up)
+
+    ticket_help = "the ticket whose stack to act on (default: from the current directory)"
+
+    sp = sub.add_parser("down", help="stop services (all when none named)")
+    sp.add_argument("services", nargs="*")
+    sp.add_argument("--ticket", help=ticket_help)
+    sp.set_defaults(fn=cmd_down)
+
+    sp = sub.add_parser("restart", help="restart services with their last settings")
+    sp.add_argument("services", nargs="+")
+    sp.add_argument("--ticket", help=ticket_help)
+    sp.add_argument("--no-wait", action="store_true")
+    sp.add_argument("--timeout", type=int, default=180)
+    sp.set_defaults(fn=cmd_restart)
+
+    sp = sub.add_parser("status", help="what runs, from where, and where it points")
+    sp.add_argument("--json", action="store_true", help='print {"services": [...]} for tools')
+    sp.add_argument("--ticket", help=ticket_help)
+    sp.set_defaults(fn=cmd_status)
+
+    sp = sub.add_parser("ls", help="list the running stacks")
+    sp.add_argument("--json", action="store_true", help='print {"stacks": [...]} for tools')
+    sp.set_defaults(fn=cmd_ls)
+
+    sp = sub.add_parser("logs", help="show a service's log")
+    sp.add_argument("service")
+    sp.add_argument("--ticket", help=ticket_help)
+    sp.add_argument("-f", "--follow", action="store_true")
+    sp.add_argument("-n", "--lines", type=int, default=60)
+    sp.add_argument("-p", "--pretty", action="store_true",
+                    help="JSON lines as time, level and message, with colors (needs jq)")
+    sp.add_argument("--no-color", action="store_true", help="with --pretty: no ANSI colors")
+    sp.set_defaults(fn=cmd_logs)
+
+    a = p.parse_args()
+    global QUIET, STACK
+    QUIET = bool(getattr(a, "json", False))
+    if hasattr(a, "ticket"):
+        found, here = (False, None) if a.ticket else stack_running_here()
+        STACK = here if found else (a.ticket or infer_ticket() or "").upper() or None
+        if STACK == "DEFAULT":
+            STACK = None
+        if STACK and not TICKET_KEY.fullmatch(STACK):
+            raise SystemExit(f"--ticket takes a ticket key such as HT5-12345: {a.ticket}")
+    return a.fn(a)
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # `devstack status | head` ends quietly
+    sys.exit(main())

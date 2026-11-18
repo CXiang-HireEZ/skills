@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "skill_id": "e290c852-de9d-49d0-bf79-d185bae3954d",
+  "path": "hireez-devstack",
+  "path_key": "hireez-devstack",
+  "enabled": true,
+  "tags": [],
+  "source": {
+    "type": "local",
+    "ref": null,
+    "subpath": null,
+    "branch": null
+  }
+}
