@@ -66,7 +66,7 @@ restarts running services when that set changes (`up` or `down` of another servi
   `.env`. The original is kept as `.env.devstack-backup` and restored by `down htm`.
 - `nab`: `EZ_PROFILE_MCP_URL` → local pa when it runs.
 - `pa`: `NATIVE_AGENT_BACKEND_URL` → local nab when it runs.
-- All but `fe` get `AWS_PROFILE=test-env`, `AWS_SDK_LOAD_CONFIG=1`, `AWS_REGION=us-west-2`.
+- All but `fe` get `AWS_PROFILE=test2`, `AWS_SDK_LOAD_CONFIG=1`, `AWS_REGION=us-west-2`.
 
 Fixed per-service overrides live in `~/.hireez-dev/env/<svc>.env` (the sidecar's
 Secrets Manager paths and engine URLs are in `pa.env`). Edit those files, not the
@@ -75,7 +75,7 @@ generated `~/.hireez-dev/run/<svc>.sh`.
 ## When something fails
 
 - `doctor` or `up` prints `FAIL` lines and the commands that fix them. Some need the
-  user: `aws sso login --profile test-env` opens a browser; the `/etc/hosts` line needs
+  user: `aws sso login --profile test2` opens a browser; the `/etc/hosts` line needs
   sudo; `mkcert -install` adds a root certificate. Give the user these commands; run
   `aws sso login` yourself only after the user agrees, since they must approve it in
   the browser.

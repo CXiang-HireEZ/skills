@@ -38,7 +38,7 @@ SESSION = "devstack"
 TEMPLATES = Path(__file__).resolve().parent.parent / "templates" / "env"
 FE_SETUP = HOME / ".claude/skills/hireez-local-dev/scripts/agent-fe-https-setup.sh"
 
-AWS_PROFILE = "test-env"
+AWS_PROFILE = "test2"
 AWS_ENV = {"AWS_PROFILE": AWS_PROFILE, "AWS_SDK_LOAD_CONFIG": "1", "AWS_REGION": "us-west-2"}
 TEST2_TB = "https://api.test2.testhireez.com"
 TEST2_NAB = "https://nativeagentbe.test2.hireez.info"
