@@ -23,6 +23,8 @@ The command is `devstack` on the PATH (a link to `scripts/devstack` in this skil
 | `htm` | htm-backend | `HTTP_PORT` in its `.env` (9004) |
 | `nab` | native-agent-backend | 8000 |
 | `pa` | ez-profile-agent (sidecar MCP) | 8765 |
+| `ca` | ez-candidate-agent (api role, local Postgres) | 8792 |
+| `cam` | ez-candidate-agent (mcp sidecar role) | 8766 |
 | `fe` | native-agent-frontend | 8084 |
 
 ## Commands
@@ -51,6 +53,9 @@ Start only what the change needs, plus whatever sits between it and the browser:
 - htm-backend change: `htm fe`
 - native-agent-backend change: `htm nab fe` (the frontend reaches nab only through htm)
 - sidecar change: `htm nab pa fe`
+- candidate notes and tags (ez-candidate-agent): `htm nab pa ca cam fe`. `cam` needs `ca`.
+  `ca` uses a local database (`CANDIDATE_AGENT_DB_DSN` in `ca.env`), so it starts with no
+  notes or tags from test2.
 
 Check which repos have a branch or changes for the ticket when it isn't clear:
 `git -C ~/Projects/<repo> branch --list '*<TICKET>*'`, and `git worktree list`.
@@ -61,10 +66,14 @@ Do not edit these by hand. devstack sets them from which services run locally, a
 restarts running services when that set changes (`up` or `down` of another service).
 
 - `fe`: `LOCAL_TB_BACKEND` → local htm, else `https://api.test2.testhireez.com`.
-- `htm`: `NATIVE_AGENT_BE_URL` → local nab, else test2. htm-backend ignores the process
-  env for anything in its `.env`, so this one line is written into the checkout's
-  `.env`. The original is kept as `.env.devstack-backup` and restored by `down htm`.
-- `nab`: `EZ_PROFILE_MCP_URL` → local pa when it runs.
+- `htm`: `NATIVE_AGENT_BE_URL` → local nab, else test2, and `EZ_CANDIDATE_AGENT_API_URL` →
+  local ca, else test2. htm-backend ignores the process env for anything in its `.env`, so
+  these lines are written into the checkout's `.env`. The original is kept as `.env.devstack-backup` and restored by `down htm`.
+- `nab`: `EZ_PROFILE_MCP_URL` → local pa when it runs; `EZ_CANDIDATE_AGENT_API_URL` → local
+  ca and `EZ_CANDIDATE_AGENT_MCP_URL` → local cam when they run.
+- `ca`: `NATIVE_AGENT_BACKEND_INTERNAL_URL` → local nab, else test2;
+  `PROFILE_AGENT_INTERNAL_URL` → local pa when it runs.
+- `cam`: `CANDIDATE_AGENT_API_URL` → local ca.
 - `pa`: `NATIVE_AGENT_BACKEND_URL` → local nab when it runs.
 - All but `fe` get `AWS_PROFILE=test2`, `AWS_SDK_LOAD_CONFIG=1`, `AWS_REGION=us-west-2`.
 
