@@ -25,6 +25,7 @@ The command is `devstack` on the PATH (a link to `scripts/devstack` in this skil
 | `pa` | ez-profile-agent (sidecar MCP) | 8765 |
 | `ca` | ez-candidate-agent (api role, local Postgres) | 8792 |
 | `cam` | ez-candidate-agent (mcp sidecar role) | 8766 |
+| `cac` | ez-candidate-agent (merge consumer role) | none |
 | `fe` | native-agent-frontend | 8084 |
 
 ## Commands
@@ -54,6 +55,10 @@ Start only what the change needs, plus whatever sits between it and the browser:
 - native-agent-backend change: `htm nab fe` (the frontend reaches nab only through htm)
 - sidecar change: `htm nab pa fe`
 - candidate notes and tags (ez-candidate-agent): `htm nab pa ca cam fe`. `cam` needs `ca`.
+  Add `cac` only to test candidate merges: it reads the merge topic of test2 Kafka in a
+  local group (`candidateagentconsumer.localdev.<user>`, never the group of a deployed
+  consumer) and applies each merge to the local ca. It has no port; `up` and `status` read
+  its state from its log.
   `ca` uses a local database (`CANDIDATE_AGENT_DB_DSN` in `ca.env`), so it starts with no
   notes or tags from test2.
 
@@ -73,7 +78,7 @@ restarts running services when that set changes (`up` or `down` of another servi
   ca and `EZ_CANDIDATE_AGENT_MCP_URL` → local cam when they run.
 - `ca`: `NATIVE_AGENT_BACKEND_INTERNAL_URL` → local nab, else test2;
   `PROFILE_AGENT_INTERNAL_URL` → local pa when it runs.
-- `cam`: `CANDIDATE_AGENT_API_URL` → local ca.
+- `cam` and `cac`: `CANDIDATE_AGENT_API_URL` → local ca.
 - `pa`: `NATIVE_AGENT_BACKEND_URL` → local nab when it runs.
 - All but `fe` get `AWS_PROFILE=test2`, `AWS_SDK_LOAD_CONFIG=1`, `AWS_REGION=us-west-2`.
 
